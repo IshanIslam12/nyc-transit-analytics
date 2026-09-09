@@ -1,0 +1,10 @@
+.env
+backend/.env
+frontend/.env
+backend/.venv/
+frontend/node_modules/
+__pycache__/
+.pytest_cache/
+*.pyc
+dist/
+data/google_transit.zip
