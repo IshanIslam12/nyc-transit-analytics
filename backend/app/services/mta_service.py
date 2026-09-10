@@ -1,5 +1,6 @@
-from datetime import datetime
-from zoneinfo import ZoneInfo
+import math
+import time
+from datetime import datetime, timezone
 
 import requests
 from google.transit import gtfs_realtime_pb2
@@ -7,41 +8,51 @@ from google.transit import gtfs_realtime_pb2
 from app.services.station_service import get_station_name
 
 
+# ============================================================
+# MTA GTFS-REALTIME FEEDS
+# ============================================================
+
 MTA_FEED_URLS = {
-    "1234567": (
+    "numbered": (
         "https://api-endpoint.mta.info/"
         "Dataservice/mtagtfsfeeds/nyct%2Fgtfs"
     ),
-    "ACE": (
+    "ace": (
         "https://api-endpoint.mta.info/"
         "Dataservice/mtagtfsfeeds/nyct%2Fgtfs-ace"
     ),
-    "BDFM": (
+    "bdfm": (
         "https://api-endpoint.mta.info/"
         "Dataservice/mtagtfsfeeds/nyct%2Fgtfs-bdfm"
     ),
-    "G": (
+    "g": (
         "https://api-endpoint.mta.info/"
         "Dataservice/mtagtfsfeeds/nyct%2Fgtfs-g"
     ),
-    "JZ": (
+    "jz": (
         "https://api-endpoint.mta.info/"
         "Dataservice/mtagtfsfeeds/nyct%2Fgtfs-jz"
     ),
-    "L": (
+    "l": (
         "https://api-endpoint.mta.info/"
         "Dataservice/mtagtfsfeeds/nyct%2Fgtfs-l"
     ),
-    "NQRW": (
+    "nqrw": (
         "https://api-endpoint.mta.info/"
         "Dataservice/mtagtfsfeeds/nyct%2Fgtfs-nqrw"
     ),
 }
 
-NY_TIMEZONE = ZoneInfo("America/New_York")
 
+# ============================================================
+# BASIC HELPERS
+# ============================================================
 
 def fetch_feed(url: str):
+    """
+    Download and parse one MTA GTFS-Realtime feed.
+    """
+
     response = requests.get(
         url,
         timeout=15,
@@ -50,356 +61,433 @@ def fetch_feed(url: str):
     response.raise_for_status()
 
     feed = gtfs_realtime_pb2.FeedMessage()
-    feed.ParseFromString(
-        response.content
-    )
+    feed.ParseFromString(response.content)
 
     return feed
 
 
-def get_subway_feed():
+def get_subway_feed(feed_name: str = "numbered"):
+    """
+    Return one subway GTFS-Realtime feed.
+    """
+
+    if feed_name not in MTA_FEED_URLS:
+        raise ValueError(
+            f"Unknown subway feed: {feed_name}"
+        )
+
     return fetch_feed(
-        MTA_FEED_URLS["1234567"]
+        MTA_FEED_URLS[feed_name]
     )
 
 
 def get_subway_feeds():
-    feeds = []
+    """
+    Fetch every configured subway feed.
 
-    for feed_name, url in (
-        MTA_FEED_URLS.items()
-    ):
+    If one feed fails, the remaining feeds are still returned.
+    """
+
+    feeds = {}
+
+    for feed_name, url in MTA_FEED_URLS.items():
         try:
-            feed = fetch_feed(url)
-
-            feeds.append(
-                {
-                    "name": feed_name,
-                    "feed": feed,
-                }
-            )
+            feeds[feed_name] = fetch_feed(url)
 
         except Exception as exc:
             print(
-                f"Could not fetch MTA feed "
+                f"Failed to fetch MTA feed "
                 f"{feed_name}: {exc}"
             )
 
     return feeds
 
 
-def get_direction(stop_id: str):
-    if stop_id.endswith("N"):
+# ============================================================
+# ARRIVAL HELPERS
+# ============================================================
+
+def get_direction(stop_id: str) -> str:
+    """
+    Determine train direction using the stop ID suffix.
+
+    Most NYC Subway realtime stop IDs end in:
+    N = northbound
+    S = southbound
+    """
+
+    if not stop_id:
+        return "Unknown"
+
+    stop_id_upper = stop_id.upper()
+
+    if stop_id_upper.endswith("N"):
         return "Northbound"
 
-    if stop_id.endswith("S"):
+    if stop_id_upper.endswith("S"):
         return "Southbound"
 
     return "Unknown"
 
 
+def get_base_stop_id(stop_id: str) -> str:
+    """
+    Remove the N/S realtime direction suffix from a stop ID.
+
+    Example:
+        127N -> 127
+        A27S -> A27
+    """
+
+    if not stop_id:
+        return stop_id
+
+    if stop_id[-1:].upper() in {"N", "S"}:
+        return stop_id[:-1]
+
+    return stop_id
+
+
 def format_arrival_time(
-    timestamp: int
-):
-    return datetime.fromtimestamp(
+    timestamp: int,
+) -> str:
+    """
+    Convert a Unix arrival timestamp to an ISO timestamp.
+    """
+
+    arrival_datetime = datetime.fromtimestamp(
         timestamp,
-        tz=NY_TIMEZONE,
+        tz=timezone.utc,
     )
 
-
-def matches_station(
-    arrival_station_name: str,
-    requested_station: str | None,
-):
-    if not requested_station:
-        return True
-
-    return (
-        arrival_station_name
-        .strip()
-        .lower()
-        ==
-        requested_station
-        .strip()
-        .lower()
-    )
+    return arrival_datetime.isoformat()
 
 
-def matches_route(
-    arrival_route_id: str,
-    requested_route_id: str | None,
-):
-    if not requested_route_id:
-        return True
+def get_arrival_timestamp(stop_time_update):
+    """
+    Get the best realtime timestamp available for a stop.
 
-    return (
-        arrival_route_id
-        .strip()
-        .upper()
-        ==
-        requested_route_id
-        .strip()
-        .upper()
-    )
+    GTFS-Realtime normally provides arrival.time.
+    Some updates may only provide departure.time, so departure
+    is used as a fallback.
+    """
 
+    if (
+        stop_time_update.HasField("arrival")
+        and stop_time_update.arrival.time > 0
+    ):
+        return stop_time_update.arrival.time
+
+    if (
+        stop_time_update.HasField("departure")
+        and stop_time_update.departure.time > 0
+    ):
+        return stop_time_update.departure.time
+
+    return None
+
+
+# ============================================================
+# LIVE TRAIN ARRIVALS
+# ============================================================
 
 def get_train_arrivals(
-    limit: int = 20,
+    limit: int = 100,
     station: str | None = None,
     route_id: str | None = None,
 ):
+    """
+    Return live NYC Subway arrival predictions.
+
+    Each arrival includes a live countdown calculated from the
+    MTA GTFS-Realtime Unix timestamp.
+
+    Example:
+        arrival timestamp - current timestamp = 336 seconds
+        ceil(336 / 60) = 6 minutes
+    """
+
     feeds = get_subway_feeds()
+
+    current_timestamp = int(time.time())
 
     arrivals = []
 
-    now = datetime.now(
-        NY_TIMEZONE
+    normalized_station = (
+        station.strip().lower()
+        if station
+        else None
     )
 
-    for feed_data in feeds:
-        feed = feed_data["feed"]
+    normalized_route = (
+        route_id.strip().upper()
+        if route_id
+        else None
+    )
+
+    for feed_name, feed in feeds.items():
 
         for entity in feed.entity:
-            if not entity.HasField(
-                "trip_update"
-            ):
+
+            if not entity.HasField("trip_update"):
                 continue
 
-            trip_update = (
-                entity.trip_update
-            )
+            trip_update = entity.trip_update
 
             trip = trip_update.trip
 
-            current_route_id = (
-                trip.route_id
+            trip_route_id = (
+                trip.route_id.strip()
+                if trip.route_id
+                else ""
             )
 
             trip_id = (
-                trip.trip_id
+                trip.trip_id.strip()
+                if trip.trip_id
+                else ""
             )
 
-            if not matches_route(
-                current_route_id,
-                route_id,
-            ):
+            if not trip_route_id:
                 continue
 
-            for stop_update in (
-                trip_update
-                .stop_time_update
-            ):
-                if not (
-                    stop_update.HasField(
-                        "arrival"
-                    )
+            # Route filtering
+            if normalized_route:
+                if (
+                    trip_route_id.upper()
+                    != normalized_route
                 ):
+                    continue
+
+            for stop_time_update in (
+                trip_update.stop_time_update
+            ):
+
+                stop_id = (
+                    stop_time_update.stop_id.strip()
+                    if stop_time_update.stop_id
+                    else ""
+                )
+
+                if not stop_id:
                     continue
 
                 arrival_timestamp = (
-                    stop_update
-                    .arrival
-                    .time
-                )
-
-                if (
-                    arrival_timestamp <= 0
-                ):
-                    continue
-
-                arrival_datetime = (
-                    format_arrival_time(
-                        arrival_timestamp
+                    get_arrival_timestamp(
+                        stop_time_update
                     )
                 )
 
+                if arrival_timestamp is None:
+                    continue
+
+                # Ignore trains whose predicted arrival has passed.
                 seconds_away = (
-                    arrival_datetime
-                    - now
-                ).total_seconds()
+                    arrival_timestamp
+                    - current_timestamp
+                )
 
                 if seconds_away < 0:
                     continue
 
-                minutes_away = int(
-                    seconds_away / 60
+                # IMPORTANT:
+                # ceil gives proper countdown behavior.
+                #
+                # 361 seconds -> 7 min
+                # 330 seconds -> 6 min
+                # 125 seconds -> 3 min
+                # 61 seconds  -> 2 min
+                # 30 seconds  -> 1 min
+                minutes_away = max(
+                    1,
+                    math.ceil(
+                        seconds_away / 60
+                    ),
                 )
 
-                stop_id = (
-                    stop_update.stop_id
+                base_stop_id = get_base_stop_id(
+                    stop_id
                 )
 
-                station_name = (
-                    get_station_name(
+                station_name = get_station_name(
+                    base_stop_id
+                )
+
+                if not station_name:
+                    station_name = stop_id
+
+                # Exact station filtering
+                if normalized_station:
+                    if (
+                        station_name.strip().lower()
+                        != normalized_station
+                    ):
+                        continue
+
+                arrival = {
+                    "route_id": trip_route_id,
+                    "trip_id": trip_id,
+                    "stop_id": stop_id,
+                    "station_name": station_name,
+                    "direction": get_direction(
                         stop_id
-                    )
-                )
+                    ),
+                    "arrival_time": (
+                        format_arrival_time(
+                            arrival_timestamp
+                        )
+                    ),
+                    "arrival_timestamp": (
+                        arrival_timestamp
+                    ),
+                    "seconds_away": seconds_away,
+                    "minutes_away": minutes_away,
+                    "feed": feed_name,
+                }
 
-                if not matches_station(
-                    station_name,
-                    station,
-                ):
-                    continue
+                arrivals.append(arrival)
 
-                arrivals.append(
-                    {
-                        "route_id":
-                            current_route_id,
-                        "trip_id":
-                            trip_id,
-                        "stop_id":
-                            stop_id,
-                        "station_name":
-                            station_name,
-                        "direction":
-                            get_direction(
-                                stop_id
-                            ),
-                        "arrival_time":
-                            arrival_datetime
-                            .isoformat(),
-                        "minutes_away":
-                            minutes_away,
-                    }
-                )
-
+    # Nearest trains first.
     arrivals.sort(
-        key=lambda arrival:
-            arrival[
-                "arrival_time"
-            ]
+        key=lambda item: (
+            item["arrival_timestamp"],
+            item["route_id"],
+            item["station_name"],
+        )
     )
 
     return arrivals[:limit]
 
 
-def get_translation_text(
-    translated_string
-):
+# ============================================================
+# SERVICE ALERT HELPERS
+# ============================================================
+
+def get_translated_text(
+    translated_string,
+) -> str:
+    """
+    Extract English text from a GTFS translated string.
+
+    Falls back to the first available translation.
+    """
+
+    if not translated_string:
+        return ""
+
+    fallback = ""
+
     for translation in (
         translated_string.translation
     ):
-        if (
-            translation.language
-            .lower()
-            == "en"
-        ):
-            return translation.text
 
-    if (
-        translated_string.translation
-    ):
-        return (
-            translated_string
-            .translation[0]
-            .text
+        text = translation.text.strip()
+
+        if not text:
+            continue
+
+        if not fallback:
+            fallback = text
+
+        language = (
+            translation.language.lower()
+            if translation.language
+            else ""
         )
 
-    return ""
+        if language.startswith("en"):
+            return text
+
+    return fallback
 
 
 def get_alert_routes(alert):
+    """
+    Extract subway route IDs referenced by an alert.
+    """
+
     routes = set()
 
     for informed_entity in (
         alert.informed_entity
     ):
-        route_id = (
-            informed_entity.route_id
+
+        route = (
+            informed_entity.route_id.strip()
+            if informed_entity.route_id
+            else ""
         )
 
-        if route_id:
-            routes.add(
-                route_id
-            )
-
-        if (
-            informed_entity
-            .HasField("trip")
-        ):
-            trip_route_id = (
-                informed_entity
-                .trip
-                .route_id
-            )
-
-            if trip_route_id:
-                routes.add(
-                    trip_route_id
-                )
+        if route:
+            routes.add(route)
 
     return sorted(routes)
 
 
 def get_alert_stops(alert):
-    stops = []
+    """
+    Extract stop IDs referenced by an alert.
+    """
 
-    seen = set()
+    stops = set()
 
     for informed_entity in (
         alert.informed_entity
     ):
-        stop_id = (
-            informed_entity.stop_id
+
+        stop = (
+            informed_entity.stop_id.strip()
+            if informed_entity.stop_id
+            else ""
         )
 
-        if not stop_id:
-            continue
+        if stop:
+            stops.add(stop)
 
-        base_stop_id = stop_id
+    return sorted(stops)
 
-        if stop_id.endswith(
-            ("N", "S")
-        ):
-            base_stop_id = (
-                stop_id[:-1]
+
+def get_alert_effect(alert) -> str:
+    """
+    Convert GTFS alert effect enum into a readable string.
+    """
+
+    try:
+        effect_name = (
+            gtfs_realtime_pb2.Alert.Effect.Name(
+                alert.effect
             )
-
-        if base_stop_id in seen:
-            continue
-
-        seen.add(
-            base_stop_id
         )
 
-        stops.append(
-            {
-                "stop_id":
-                    base_stop_id,
-                "station_name":
-                    get_station_name(
-                        base_stop_id
-                    ),
-            }
-        )
+        return effect_name.replace(
+            "_",
+            " ",
+        ).title()
 
-    return stops
+    except Exception:
+        return "Service Alert"
 
 
 def get_active_periods(alert):
+    """
+    Convert GTFS alert active periods to JSON-safe data.
+    """
+
     periods = []
 
-    for period in (
-        alert.active_period
-    ):
-        start = None
-        end = None
+    for period in alert.active_period:
 
-        if period.start:
-            start = (
-                datetime.fromtimestamp(
-                    period.start,
-                    tz=NY_TIMEZONE,
-                ).isoformat()
-            )
+        start = (
+            period.start
+            if period.HasField("start")
+            else None
+        )
 
-        if period.end:
-            end = (
-                datetime.fromtimestamp(
-                    period.end,
-                    tz=NY_TIMEZONE,
-                ).isoformat()
-            )
+        end = (
+            period.end
+            if period.HasField("end")
+            else None
+        )
 
         periods.append(
             {
@@ -411,120 +499,96 @@ def get_active_periods(alert):
     return periods
 
 
+# ============================================================
+# SERVICE ALERTS
+# ============================================================
+
 def get_service_alerts(
     route_id: str | None = None,
 ):
+    """
+    Return active MTA subway service alerts.
+
+    A route may optionally be supplied to filter alerts.
+    """
+
     feeds = get_subway_feeds()
 
     alerts = []
 
+    normalized_route = (
+        route_id.strip().upper()
+        if route_id
+        else None
+    )
+
     seen_alert_ids = set()
 
-    for feed_data in feeds:
-        feed_name = (
-            feed_data["name"]
-        )
-
-        feed = (
-            feed_data["feed"]
-        )
+    for feed_name, feed in feeds.items():
 
         for entity in feed.entity:
-            if not entity.HasField(
-                "alert"
-            ):
-                continue
 
-            if (
-                entity.id
-                in seen_alert_ids
-            ):
+            if not entity.HasField("alert"):
                 continue
 
             alert = entity.alert
 
-            routes = (
-                get_alert_routes(
-                    alert
+            alert_id = (
+                entity.id
+                if entity.id
+                else (
+                    f"{feed_name}-"
+                    f"{len(alerts)}"
                 )
             )
 
-            if (
-                route_id
-                and route_id.upper()
-                not in [
-                    route.upper()
-                    for route in routes
-                ]
-            ):
+            # Avoid duplicate alert entities that can appear
+            # across feeds.
+            if alert_id in seen_alert_ids:
                 continue
 
-            header = (
-                get_translation_text(
-                    alert.header_text
+            routes = get_alert_routes(alert)
+
+            if normalized_route:
+                route_matches = any(
+                    route.upper()
+                    == normalized_route
+                    for route in routes
                 )
+
+                if not route_matches:
+                    continue
+
+            stops = get_alert_stops(alert)
+
+            header = get_translated_text(
+                alert.header_text
             )
 
-            description = (
-                get_translation_text(
-                    alert.description_text
-                )
+            description = get_translated_text(
+                alert.description_text
             )
 
-            cause_name = (
-                gtfs_realtime_pb2
-                .Alert
-                .Cause
-                .Name(
-                    alert.cause
-                )
-            )
-
-            effect_name = (
-                gtfs_realtime_pb2
-                .Alert
-                .Effect
-                .Name(
-                    alert.effect
-                )
-            )
+            effect = get_alert_effect(alert)
 
             alerts.append(
                 {
-                    "id":
-                        entity.id,
-                    "feed":
-                        feed_name,
-                    "routes":
-                        routes,
-                    "stations":
-                        get_alert_stops(
-                            alert
-                        ),
-                    "header":
-                        header,
-                    "description":
-                        description,
-                    "cause":
-                        cause_name,
-                    "effect":
-                        effect_name,
-                    "active_periods":
-                        get_active_periods(
-                            alert
-                        ),
+                    "id": alert_id,
+                    "routes": routes,
+                    "stops": stops,
+                    "effect": effect,
+                    "header": (
+                        header
+                        or "MTA Service Alert"
+                    ),
+                    "description": description,
+                    "active_periods": (
+                        get_active_periods(alert)
+                    ),
+                    "feed": feed_name,
                 }
             )
 
-            seen_alert_ids.add(
-                entity.id
-            )
-
-    alerts.sort(
-        key=lambda item: (
-            item["routes"],
-            item["header"],
-        )
-    )
+            seen_alert_ids.add(alert_id)
 
     return alerts
