@@ -33,18 +33,8 @@ const API_BASE_URL =
   "http://localhost:8000";
 
 
-type Arrival = {
-  route_id: string;
-  trip_id: string;
-  stop_id: string;
-  station_name: string;
-  direction: string;
-  arrival_time: string;
-  arrival_timestamp?: number;
-  seconds_away?: number;
-  minutes_away: number;
-  feed?: string;
-};
+const ARRIVAL_REFRESH_MS = 30_000;
+const DASHBOARD_REFRESH_MS = 60_000;
 
 
 type Station = {
@@ -55,13 +45,25 @@ type Station = {
 };
 
 
+type Arrival = {
+  route_id: string;
+  trip_id?: string;
+  stop_id?: string;
+  station_name: string;
+  direction?: string;
+  arrival_time?: string;
+  arrival_timestamp?: number;
+  seconds_away?: number;
+  minutes_away?: number;
+};
+
+
 type ServiceAlert = {
-  id: string;
-  routes: string[];
-  stops: string[];
-  effect: string;
-  header: string;
-  description: string;
+  id?: string;
+  header_text?: string;
+  description_text?: string;
+  routes?: string[];
+  stops?: string[];
 };
 
 
@@ -114,11 +116,11 @@ const ROUTES = [
 
 
 function App() {
-  const [arrivals, setArrivals] =
-    useState<Arrival[]>([]);
-
   const [stations, setStations] =
     useState<Station[]>([]);
+
+  const [arrivals, setArrivals] =
+    useState<Arrival[]>([]);
 
   const [alerts, setAlerts] =
     useState<ServiceAlert[]>([]);
@@ -129,90 +131,96 @@ function App() {
   const [
     reliabilityHistory,
     setReliabilityHistory,
-  ] = useState<
-    ReliabilityHistoryPoint[]
-  >([]);
+  ] = useState<ReliabilityHistoryPoint[]>([]);
 
-  const [
-    selectedRoute,
-    setSelectedRoute,
-  ] = useState("");
+  const [selectedRoute, setSelectedRoute] =
+    useState("");
 
-  const [
-    stationSearch,
-    setStationSearch,
-  ] = useState("");
+  const [stationSearch, setStationSearch] =
+    useState("");
 
-  const [
-    selectedStation,
-    setSelectedStation,
-  ] = useState("");
+  const [selectedStation, setSelectedStation] =
+    useState("");
 
   const [loading, setLoading] =
+    useState(true);
+
+  const [refreshing, setRefreshing] =
     useState(false);
 
   const [error, setError] =
     useState("");
 
-  const [
-    lastUpdated,
-    setLastUpdated,
-  ] = useState<Date | null>(null);
+  const [lastUpdated, setLastUpdated] =
+    useState<Date | null>(null);
 
 
-  // ============================================================
-  // STATIONS
-  // ============================================================
+  const fetchJson = useCallback(
+    async (url: string, options?: RequestInit) => {
+      const separator =
+        url.includes("?") ? "&" : "?";
 
-  const fetchStations =
-    useCallback(async () => {
+      const cacheBuster =
+        `${separator}_=${Date.now()}`;
+
+      const response = await fetch(
+        `${url}${cacheBuster}`,
+        {
+          ...options,
+          cache: "no-store",
+          headers: {
+            "Cache-Control": "no-cache",
+            ...(options?.headers || {}),
+          },
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error(
+          `Request failed: ${response.status}`
+        );
+      }
+
+      return response.json();
+    },
+    []
+  );
+
+
+  const fetchStations = useCallback(
+    async () => {
       try {
-        const response = await fetch(
+        const data = await fetchJson(
           `${API_BASE_URL}/api/transit/stations`
         );
 
-        if (!response.ok) {
-          throw new Error(
-            "Unable to load stations."
-          );
-        }
+        const stationData = Array.isArray(data)
+          ? data
+          : Array.isArray(data?.stations)
+          ? data.stations
+          : [];
 
-        const data =
-          await response.json();
-
-        const rawStations =
-          Array.isArray(data)
-            ? data
-            : Array.isArray(
-                  data?.stations
-                )
-              ? data.stations
-              : [];
-
-        const normalized: Station[] =
-          rawStations
+        const normalizedStations =
+          stationData
             .map((station: any) => ({
-              stop_id:
-                station.stop_id ?? "",
+              stop_id: String(
+                station.stop_id ?? ""
+              ),
 
-              station_name:
-                station.station_name ??
-                station.name ??
-                "",
+              station_name: String(
+                station.station_name ?? ""
+              ),
 
               latitude: Number(
-                station.latitude ??
-                  station.lat
+                station.latitude
               ),
 
               longitude: Number(
-                station.longitude ??
-                  station.lon
+                station.longitude
               ),
             }))
             .filter(
               (station: Station) =>
-                station.stop_id &&
                 station.station_name &&
                 Number.isFinite(
                   station.latitude
@@ -222,39 +230,39 @@ function App() {
                 )
             );
 
-        setStations(normalized);
+        setStations(
+          normalizedStations
+        );
       } catch (err) {
         console.error(
-          "Stations error:",
+          "Failed to fetch stations:",
           err
         );
       }
-    }, []);
+    },
+    [fetchJson]
+  );
 
 
-  // ============================================================
-  // ARRIVALS
-  // ============================================================
-
-  const fetchArrivals =
-    useCallback(async () => {
+  const fetchArrivals = useCallback(
+    async () => {
       if (!selectedStation) {
         setArrivals([]);
         return;
       }
 
       try {
-        setLoading(true);
-        setError("");
-
         const params =
           new URLSearchParams();
-
-        params.set("limit", "50");
 
         params.set(
           "station",
           selectedStation
+        );
+
+        params.set(
+          "limit",
+          "100"
         );
 
         if (selectedRoute) {
@@ -264,101 +272,95 @@ function App() {
           );
         }
 
-        const response = await fetch(
+        const data = await fetchJson(
           `${API_BASE_URL}/api/transit/arrivals?${params.toString()}`
         );
 
-        if (!response.ok) {
-          throw new Error(
-            "Unable to load arrivals."
-          );
-        }
-
-        const data =
-          await response.json();
-
-        const rawArrivals =
+        const arrivalData =
           Array.isArray(data)
             ? data
             : Array.isArray(
-                  data?.arrivals
-                )
-              ? data.arrivals
-              : [];
+                data?.arrivals
+              )
+            ? data.arrivals
+            : Array.isArray(
+                data?.data?.arrivals
+              )
+            ? data.data.arrivals
+            : [];
 
-        const normalized: Arrival[] =
-          rawArrivals
-            .map((arrival: any) => ({
-              route_id:
-                arrival.route_id ?? "",
-
-              trip_id:
-                arrival.trip_id ?? "",
-
-              stop_id:
-                arrival.stop_id ?? "",
-
-              station_name:
-                arrival.station_name ??
-                "",
-
-              direction:
-                arrival.direction ??
-                "Unknown",
-
-              arrival_time:
-                arrival.arrival_time ??
-                "",
-
-              arrival_timestamp:
-                arrival.arrival_timestamp,
-
-              seconds_away:
-                arrival.seconds_away,
-
-              minutes_away: Number(
-                arrival.minutes_away ??
-                  0
+        const normalizedArrivals =
+          arrivalData.map(
+            (arrival: any) => ({
+              route_id: String(
+                arrival.route_id ?? ""
               ),
 
-              feed:
-                arrival.feed,
-            }))
-            .sort(
-              (
-                a: Arrival,
-                b: Arrival
-              ) =>
-                a.minutes_away -
-                b.minutes_away
-            );
+              trip_id:
+                arrival.trip_id,
 
-        setArrivals(normalized);
-        setLastUpdated(new Date());
+              stop_id:
+                arrival.stop_id,
+
+              station_name: String(
+                arrival.station_name ??
+                  selectedStation
+              ),
+
+              direction:
+                arrival.direction,
+
+              arrival_time:
+                arrival.arrival_time,
+
+              arrival_timestamp:
+                arrival.arrival_timestamp !==
+                undefined
+                  ? Number(
+                      arrival.arrival_timestamp
+                    )
+                  : undefined,
+
+              seconds_away:
+                arrival.seconds_away !==
+                undefined
+                  ? Number(
+                      arrival.seconds_away
+                    )
+                  : undefined,
+
+              minutes_away:
+                arrival.minutes_away !==
+                undefined
+                  ? Number(
+                      arrival.minutes_away
+                    )
+                  : undefined,
+            })
+          );
+
+        setArrivals(
+          normalizedArrivals
+        );
       } catch (err) {
         console.error(
-          "Arrivals error:",
+          "Failed to fetch arrivals:",
           err
         );
 
-        setError(
-          "Unable to load live arrivals."
-        );
-      } finally {
-        setLoading(false);
+        setArrivals([]);
       }
-    }, [
-      selectedStation,
+    },
+    [
+      fetchJson,
       selectedRoute,
-    ]);
+      selectedStation,
+    ]
+  );
 
 
-  // ============================================================
-  // ALERTS
-  // ============================================================
-
-  const fetchAlerts =
-    useCallback(async () => {
+  const fetchAlerts = useCallback(
+    async () => {
       try {
         const params =
           new URLSearchParams();
@@ -371,234 +373,111 @@ function App() {
         }
 
         const query =
-          params.toString();
+          params.toString()
+            ? `?${params.toString()}`
+            : "";
 
-        const url = query
-          ? `${API_BASE_URL}/api/transit/alerts?${query}`
-          : `${API_BASE_URL}/api/transit/alerts`;
+        const data = await fetchJson(
+          `${API_BASE_URL}/api/transit/alerts${query}`
+        );
 
-        const response =
-          await fetch(url);
-
-        if (!response.ok) {
-          throw new Error(
-            "Unable to load alerts."
-          );
-        }
-
-        const data =
-          await response.json();
-
-        const rawAlerts =
+        const alertData =
           Array.isArray(data)
             ? data
             : Array.isArray(
-                  data?.alerts
-                )
-              ? data.alerts
-              : [];
+                data?.alerts
+              )
+            ? data.alerts
+            : Array.isArray(
+                data?.data?.alerts
+              )
+            ? data.data.alerts
+            : [];
 
-        const normalized: ServiceAlert[] =
-          rawAlerts.map(
-            (
-              alert: any,
-              index: number
-            ) => ({
+        const normalizedAlerts =
+          alertData.map(
+            (alert: any) => ({
               id:
-                alert.id ??
-                `alert-${index}`,
+                alert.id !== undefined
+                  ? String(alert.id)
+                  : undefined,
+
+              header_text: String(
+                alert.header_text ??
+                  alert.header ??
+                  "Service Alert"
+              ),
+
+              description_text:
+                String(
+                  alert.description_text ??
+                    alert.description ??
+                    ""
+                ),
 
               routes:
                 Array.isArray(
                   alert.routes
                 )
-                  ? alert.routes
+                  ? alert.routes.map(
+                      String
+                    )
                   : [],
 
               stops:
                 Array.isArray(
                   alert.stops
                 )
-                  ? alert.stops
+                  ? alert.stops.map(
+                      String
+                    )
                   : [],
-
-              effect:
-                alert.effect ??
-                "Unknown Effect",
-
-              header:
-                alert.header ??
-                "MTA Service Alert",
-
-              description:
-                alert.description ??
-                "",
             })
           );
 
-        setAlerts(normalized);
+        setAlerts(
+          normalizedAlerts
+        );
       } catch (err) {
         console.error(
-          "Alerts error:",
+          "Failed to fetch alerts:",
           err
         );
 
         setAlerts([]);
       }
-    }, [selectedRoute]);
+    },
+    [
+      fetchJson,
+      selectedRoute,
+    ]
+  );
 
-
-  // ============================================================
-  // ROUTE RELIABILITY
-  // ============================================================
 
   const fetchReliability =
-    useCallback(async () => {
-      try {
-        const response = await fetch(
-          `${API_BASE_URL}/api/analytics/route-reliability`
-        );
+    useCallback(
+      async () => {
+        try {
+          const data =
+            await fetchJson(
+              `${API_BASE_URL}/api/analytics/route-reliability`
+            );
 
-        if (!response.ok) {
-          throw new Error(
-            "Unable to load route reliability."
-          );
-        }
-
-        const data =
-          await response.json();
-
-        const rawRoutes =
-          Array.isArray(data)
-            ? data
-            : Array.isArray(
+          const routeData =
+            Array.isArray(data)
+              ? data
+              : Array.isArray(
                   data?.routes
                 )
               ? data.routes
               : [];
 
-        const normalized: ReliabilityItem[] =
-          rawRoutes
-            .map((item: any) => ({
-              route_id:
-                String(
+          const normalized =
+            routeData
+              .map((item: any) => ({
+                route_id: String(
                   item.route_id ?? ""
                 ),
-
-              average_prediction_change_minutes:
-                Number(
-                  item.average_prediction_change_minutes ??
-                    0
-                ),
-
-              delayed_prediction_percentage:
-                Number(
-                  item.delayed_prediction_percentage ??
-                    0
-                ),
-
-              samples:
-                Number(
-                  item.samples ?? 0
-                ),
-            }))
-            .filter(
-              (
-                item: ReliabilityItem
-              ) =>
-                item.route_id &&
-                Number.isFinite(
-                  item.delayed_prediction_percentage
-                )
-            );
-
-        setReliability(normalized);
-      } catch (err) {
-        console.error(
-          "Reliability error:",
-          err
-        );
-
-        setReliability([]);
-      }
-    }, []);
-
-
-  // ============================================================
-  // RELIABILITY HISTORY
-  // ============================================================
-
-  const fetchReliabilityHistory =
-    useCallback(async () => {
-      try {
-        const params =
-          new URLSearchParams();
-
-        params.set(
-          "hours",
-          "24"
-        );
-
-        if (selectedRoute) {
-          params.set(
-            "route_id",
-            selectedRoute
-          );
-        }
-
-        const response = await fetch(
-          `${API_BASE_URL}/api/analytics/reliability-history?${params.toString()}`
-        );
-
-        if (!response.ok) {
-          throw new Error(
-            "Unable to load reliability history."
-          );
-        }
-
-        const data =
-          await response.json();
-
-        const rawPoints =
-          Array.isArray(data)
-            ? data
-            : Array.isArray(
-                  data?.points
-                )
-              ? data.points
-              : [];
-
-        const normalized:
-          ReliabilityHistoryPoint[] =
-          rawPoints
-            .map((item: any) => {
-              const timestamp =
-                String(
-                  item.timestamp ??
-                    ""
-                );
-
-              const date =
-                new Date(timestamp);
-
-              const displayTime =
-                !Number.isNaN(
-                  date.getTime()
-                )
-                  ? date.toLocaleTimeString(
-                      [],
-                      {
-                        hour: "numeric",
-                        minute: "2-digit",
-                      }
-                    )
-                  : timestamp;
-
-              return {
-                timestamp,
-
-                display_time:
-                  displayTime,
 
                 average_prediction_change_minutes:
                   Number(
@@ -606,139 +485,391 @@ function App() {
                       0
                   ),
 
-                samples:
+                delayed_prediction_percentage:
                   Number(
-                    item.samples ??
+                    item.delayed_prediction_percentage ??
                       0
                   ),
-              };
-            })
-            .filter(
-              (
-                point: ReliabilityHistoryPoint
-              ) =>
-                point.timestamp &&
-                Number.isFinite(
-                  point.average_prediction_change_minutes
-                )
+
+                samples: Number(
+                  item.samples ?? 0
+                ),
+              }))
+              .filter(
+                (
+                  item: ReliabilityItem
+                ) =>
+                  item.route_id
+              );
+
+          setReliability(
+            normalized
+          );
+        } catch (err) {
+          console.error(
+            "Failed to fetch reliability:",
+            err
+          );
+
+          setReliability([]);
+        }
+      },
+      [fetchJson]
+    );
+
+
+  const fetchReliabilityHistory =
+    useCallback(
+      async () => {
+        try {
+          const params =
+            new URLSearchParams();
+
+          params.set(
+            "hours",
+            "24"
+          );
+
+          if (selectedRoute) {
+            params.set(
+              "route_id",
+              selectedRoute
+            );
+          }
+
+          const data =
+            await fetchJson(
+              `${API_BASE_URL}/api/analytics/reliability-history?${params.toString()}`
             );
 
-        setReliabilityHistory(
-          normalized
+          const points =
+            Array.isArray(data)
+              ? data
+              : Array.isArray(
+                  data?.points
+                )
+              ? data.points
+              : [];
+
+          const normalized =
+            points
+              .map(
+                (point: any) => {
+                  const timestamp =
+                    String(
+                      point.timestamp ??
+                        ""
+                    );
+
+                  let displayTime =
+                    timestamp;
+
+                  if (timestamp) {
+                    const date =
+                      new Date(
+                        timestamp
+                      );
+
+                    if (
+                      !Number.isNaN(
+                        date.getTime()
+                      )
+                    ) {
+                      displayTime =
+                        date.toLocaleTimeString(
+                          [],
+                          {
+                            hour: "numeric",
+                            minute:
+                              "2-digit",
+                          }
+                        );
+                    }
+                  }
+
+                  return {
+                    timestamp,
+
+                    display_time:
+                      displayTime,
+
+                    average_prediction_change_minutes:
+                      Number(
+                        point.average_prediction_change_minutes ??
+                          0
+                      ),
+
+                    samples:
+                      Number(
+                        point.samples ??
+                          0
+                      ),
+                  };
+                }
+              )
+              .filter(
+                (
+                  point:
+                    ReliabilityHistoryPoint
+                ) =>
+                  point.timestamp
+              );
+
+          setReliabilityHistory(
+            normalized
+          );
+        } catch (err) {
+          console.error(
+            "Failed to fetch reliability history:",
+            err
+          );
+
+          setReliabilityHistory(
+            []
+          );
+        }
+      },
+      [
+        fetchJson,
+        selectedRoute,
+      ]
+    );
+
+
+  const refreshLiveData =
+    useCallback(
+      async () => {
+        await fetchArrivals();
+
+        setLastUpdated(
+          new Date()
         );
-      } catch (err) {
-        console.error(
-          "History error:",
-          err
+      },
+      [fetchArrivals]
+    );
+
+
+  const refreshDashboardData =
+    useCallback(
+      async () => {
+        await Promise.allSettled([
+          fetchAlerts(),
+          fetchReliability(),
+          fetchReliabilityHistory(),
+        ]);
+
+        setLastUpdated(
+          new Date()
         );
+      },
+      [
+        fetchAlerts,
+        fetchReliability,
+        fetchReliabilityHistory,
+      ]
+    );
 
-        setReliabilityHistory(
-          []
-        );
-      }
-    }, [selectedRoute]);
+
+  const refreshEverything =
+    useCallback(
+      async () => {
+        setRefreshing(true);
+        setError("");
+
+        try {
+          await Promise.allSettled([
+            fetchArrivals(),
+            fetchAlerts(),
+            fetchReliability(),
+            fetchReliabilityHistory(),
+          ]);
+
+          setLastUpdated(
+            new Date()
+          );
+        } catch (err) {
+          console.error(
+            "Refresh failed:",
+            err
+          );
+
+          setError(
+            "Could not refresh transit data."
+          );
+        } finally {
+          setRefreshing(false);
+        }
+      },
+      [
+        fetchArrivals,
+        fetchAlerts,
+        fetchReliability,
+        fetchReliabilityHistory,
+      ]
+    );
 
 
-  // ============================================================
-  // LOAD DATA
-  // ============================================================
-
+  /*
+   * Initial data load.
+   *
+   * Stations are static, so we only need
+   * to load them once.
+   */
   useEffect(() => {
-    fetchStations();
-    fetchReliability();
+    const initialize =
+      async () => {
+        setLoading(true);
+
+        await Promise.allSettled([
+          fetchStations(),
+          fetchAlerts(),
+          fetchReliability(),
+          fetchReliabilityHistory(),
+        ]);
+
+        setLastUpdated(
+          new Date()
+        );
+
+        setLoading(false);
+      };
+
+    initialize();
   }, [
     fetchStations,
-    fetchReliability,
-  ]);
-
-
-  useEffect(() => {
-    fetchAlerts();
-    fetchReliabilityHistory();
-  }, [
     fetchAlerts,
+    fetchReliability,
     fetchReliabilityHistory,
   ]);
 
 
-  // ============================================================
-  // ARRIVAL REFRESH
-  // ============================================================
-
+  /*
+   * Refresh arrivals whenever the user
+   * changes the selected station or route.
+   */
   useEffect(() => {
     fetchArrivals();
+  }, [fetchArrivals]);
 
+
+  /*
+   * LIVE ARRIVALS AUTO REFRESH
+   *
+   * Runs every 30 seconds while the
+   * website is open.
+   */
+  useEffect(() => {
     if (!selectedStation) {
       return;
     }
 
-    const interval =
-      window.setInterval(
-        fetchArrivals,
-        30_000
-      );
-
-    return () =>
-      window.clearInterval(
-        interval
-      );
-  }, [
-    fetchArrivals,
-    selectedStation,
-  ]);
-
-
-  // ============================================================
-  // ANALYTICS REFRESH
-  // ============================================================
-
-  useEffect(() => {
-    const interval =
+    const intervalId =
       window.setInterval(
         () => {
-          fetchReliability();
-          fetchReliabilityHistory();
-          fetchAlerts();
+          refreshLiveData();
         },
-        60_000
+        ARRIVAL_REFRESH_MS
       );
 
-    return () =>
+    return () => {
       window.clearInterval(
-        interval
+        intervalId
       );
+    };
   }, [
-    fetchReliability,
-    fetchReliabilityHistory,
-    fetchAlerts,
+    selectedStation,
+    refreshLiveData,
   ]);
 
 
-  // ============================================================
-  // SEARCH
-  // ============================================================
+  /*
+   * DASHBOARD AUTO REFRESH
+   *
+   * Refreshes alerts and historical
+   * analytics every 60 seconds.
+   */
+  useEffect(() => {
+    const intervalId =
+      window.setInterval(
+        () => {
+          refreshDashboardData();
+        },
+        DASHBOARD_REFRESH_MS
+      );
+
+    return () => {
+      window.clearInterval(
+        intervalId
+      );
+    };
+  }, [
+    refreshDashboardData,
+  ]);
+
+
+  /*
+   * When a user comes back to the tab,
+   * immediately refresh the dashboard.
+   *
+   * Browsers can slow down intervals when
+   * tabs are in the background.
+   */
+  useEffect(() => {
+    const handleVisibilityChange =
+      () => {
+        if (
+          document.visibilityState ===
+          "visible"
+        ) {
+          refreshEverything();
+        }
+      };
+
+    document.addEventListener(
+      "visibilitychange",
+      handleVisibilityChange
+    );
+
+    return () => {
+      document.removeEventListener(
+        "visibilitychange",
+        handleVisibilityChange
+      );
+    };
+  }, [refreshEverything]);
+
 
   const stationSuggestions =
     useMemo(() => {
-      const search =
+      const query =
         stationSearch
           .trim()
           .toLowerCase();
 
       if (
-        !search ||
+        query.length < 1 ||
         selectedStation
       ) {
         return [];
       }
 
-      return stations
-        .filter((station) =>
-          station.station_name
+      const uniqueNames =
+        Array.from(
+          new Set(
+            stations.map(
+              (station) =>
+                station.station_name
+            )
+          )
+        );
+
+      return uniqueNames
+        .filter((name) =>
+          name
             .toLowerCase()
-            .includes(search)
+            .includes(query)
         )
-        .slice(0, 8);
+        .slice(0, 10);
     }, [
       stationSearch,
       selectedStation,
@@ -746,88 +877,36 @@ function App() {
     ]);
 
 
-  // ============================================================
-  // CHART DATA
-  // ============================================================
-
-  const reliabilityChartData =
-    useMemo(() => {
-      if (!selectedRoute) {
-        return reliability;
-      }
-
-      return reliability.filter(
-        (item) =>
-          item.route_id ===
-          selectedRoute
-      );
-    }, [
-      reliability,
-      selectedRoute,
-    ]);
-
-
-  // ============================================================
-  // SELECT STATION
-  // ============================================================
-
   const chooseStation = (
     stationName: string
   ) => {
-    setStationSearch(
+    setSelectedStation(
       stationName
     );
 
-    setSelectedStation(
+    setStationSearch(
       stationName
     );
   };
 
 
   const clearStation = () => {
-    setStationSearch("");
     setSelectedStation("");
+    setStationSearch("");
     setArrivals([]);
   };
 
 
-  // ============================================================
-  // REFRESH ALL
-  // ============================================================
-
-  const refreshDashboard =
-    async () => {
-      await Promise.all([
-        fetchArrivals(),
-        fetchAlerts(),
-        fetchReliability(),
-        fetchReliabilityHistory(),
-      ]);
-    };
-
-
-  // ============================================================
-  // STATS
-  // ============================================================
-
-  const routesTracked =
-    useMemo(() => {
-      return new Set(
-        reliability.map(
-          (item) =>
-            item.route_id
-        )
-      ).size;
-    }, [reliability]);
-
-
-  // ============================================================
-  // ARRIVAL FORMAT
-  // ============================================================
-
   const formatMinutes = (
-    minutes: number
+    minutes?: number
   ) => {
+    if (
+      minutes === undefined ||
+      Number.isNaN(minutes)
+    ) {
+      return "—";
+    }
+
     if (minutes <= 0) {
       return "Due";
     }
@@ -836,23 +915,25 @@ function App() {
   };
 
 
+  const routesTracked =
+    reliability.length;
+
+
   return (
     <div className="app">
       <main className="dashboard-container">
 
-        {/* HEADER */}
-
         <header className="dashboard-header">
           <div>
             <div className="eyebrow">
-              MTA GTFS-Realtime
+              MTA GTFS-REALTIME
             </div>
 
             <h1>
               NYC Transit Analytics
             </h1>
 
-            <p className="subtitle">
+            <p className="header-description">
               Live subway arrivals,
               prediction stability,
               service alerts, and
@@ -863,45 +944,57 @@ function App() {
           <div className="header-actions">
             <div className="live-status">
               <span className="live-dot" />
-
               Live data
             </div>
 
-            {lastUpdated && (
-              <span className="last-updated">
-                Updated{" "}
-                {lastUpdated.toLocaleTimeString(
-                  [],
-                  {
-                    hour: "numeric",
-                    minute: "2-digit",
-                  }
-                )}
-              </span>
-            )}
-
             <button
+              type="button"
               className="refresh-button"
               onClick={
-                refreshDashboard
+                refreshEverything
               }
+              disabled={refreshing}
             >
-              Refresh
+              {refreshing
+                ? "Refreshing..."
+                : "Refresh"}
             </button>
           </div>
         </header>
 
 
-        {/* FILTERS */}
+        <div className="updated-row">
+          {lastUpdated ? (
+            <span>
+              Updated{" "}
+              {lastUpdated.toLocaleTimeString()}
+              {" "}• arrivals refresh
+              every 30 sec • analytics
+              every 60 sec
+            </span>
+          ) : (
+            <span>
+              Connecting to live data...
+            </span>
+          )}
+        </div>
+
+
+        {error && (
+          <div className="error-message">
+            {error}
+          </div>
+        )}
+
 
         <section className="filters-card">
-
           <div className="filter-group">
-            <label>
+            <label htmlFor="route-select">
               Subway Route
             </label>
 
             <select
+              id="route-select"
               value={selectedRoute}
               onChange={(event) =>
                 setSelectedRoute(
@@ -919,7 +1012,7 @@ function App() {
                     key={route}
                     value={route}
                   >
-                    {route} Train
+                    {route}
                   </option>
                 )
               )}
@@ -927,21 +1020,19 @@ function App() {
           </div>
 
 
-          <div className="filter-group station-search-group">
-            <label>
+          <div className="filter-group station-filter">
+            <label htmlFor="station-search">
               Station
             </label>
 
             <div className="station-search-wrapper">
               <input
+                id="station-search"
                 type="text"
+                value={stationSearch}
                 placeholder="Search for a station..."
-                value={
-                  stationSearch
-                }
-                onChange={(
-                  event
-                ) => {
+                autoComplete="off"
+                onChange={(event) => {
                   setStationSearch(
                     event.target.value
                   );
@@ -956,25 +1047,34 @@ function App() {
                 }}
               />
 
+              {stationSearch && (
+                <button
+                  type="button"
+                  className="clear-button"
+                  onClick={
+                    clearStation
+                  }
+                  aria-label="Clear station"
+                >
+                  ×
+                </button>
+              )}
+
               {stationSuggestions.length >
                 0 && (
                 <div className="station-suggestions">
                   {stationSuggestions.map(
-                    (station) => (
+                    (name) => (
                       <button
                         type="button"
-                        key={
-                          station.stop_id
-                        }
+                        key={name}
                         onClick={() =>
                           chooseStation(
-                            station.station_name
+                            name
                           )
                         }
                       >
-                        {
-                          station.station_name
-                        }
+                        {name}
                       </button>
                     )
                   )}
@@ -982,28 +1082,12 @@ function App() {
               )}
             </div>
           </div>
-
-
-          {selectedStation && (
-            <button
-              className="clear-filter-button"
-              onClick={
-                clearStation
-              }
-            >
-              Clear station
-            </button>
-          )}
-
         </section>
 
 
-        {/* STAT CARDS */}
-
         <section className="stats-grid">
-
           <div className="stat-card">
-            <span>
+            <span className="stat-label">
               Live Arrivals
             </span>
 
@@ -1013,15 +1097,16 @@ function App() {
                 : "—"}
             </strong>
 
-            <small>
-              {selectedStation ||
-                "Select a station"}
-            </small>
+            <span className="stat-caption">
+              {selectedStation
+                ? selectedStation
+                : "Select a station"}
+            </span>
           </div>
 
 
           <div className="stat-card">
-            <span>
+            <span className="stat-label">
               Routes Tracked
             </span>
 
@@ -1029,14 +1114,14 @@ function App() {
               {routesTracked}
             </strong>
 
-            <small>
-              Realtime routes
-            </small>
+            <span className="stat-caption">
+              Reliability routes
+            </span>
           </div>
 
 
           <div className="stat-card">
-            <span>
+            <span className="stat-label">
               Active Alerts
             </span>
 
@@ -1044,14 +1129,14 @@ function App() {
               {alerts.length}
             </strong>
 
-            <small>
+            <span className="stat-caption">
               Current notices
-            </small>
+            </span>
           </div>
 
 
           <div className="stat-card">
-            <span>
+            <span className="stat-label">
               Stations Loaded
             </span>
 
@@ -1059,56 +1144,46 @@ function App() {
               {stations.length}
             </strong>
 
-            <small>
+            <span className="stat-caption">
               Subway stations
-            </small>
+            </span>
           </div>
-
         </section>
 
 
-        {/* CHARTS */}
-
         <section className="analytics-grid">
 
-          <article className="card chart-card">
+          <div className="chart-card">
+            <div className="card-heading">
+              <h2>
+                Prediction Delay Rate
+              </h2>
 
-            <div className="card-header">
-              <div>
-                <h2>
-                  Prediction Delay Rate
-                </h2>
-
-                <p>
-                  Percentage of realtime
-                  predictions that moved
-                  later. Lower is more
-                  stable.
-                </p>
-              </div>
+              <p>
+                Percentage of realtime
+                predictions that moved later.
+                Lower is more stable.
+              </p>
             </div>
 
             <div className="chart-container">
-              {reliabilityChartData.length >
+              {reliability.length >
               0 ? (
                 <ResponsiveContainer
                   width="100%"
-                  height={340}
+                  height={300}
                 >
                   <BarChart
-                    data={
-                      reliabilityChartData
-                    }
+                    data={reliability}
                     margin={{
                       top: 10,
-                      right: 10,
+                      right: 15,
+                      bottom: 10,
                       left: 0,
-                      bottom: 5,
                     }}
                   >
                     <CartesianGrid
                       strokeDasharray="3 3"
-                      vertical={false}
                     />
 
                     <XAxis
@@ -1116,7 +1191,7 @@ function App() {
                     />
 
                     <YAxis
-                      domain={[0, 35]}
+                      domain={[0, 100]}
                       tickFormatter={(
                         value
                       ) =>
@@ -1131,13 +1206,12 @@ function App() {
                         `${Number(
                           value
                         ).toFixed(2)}%`,
-                        "Prediction delay rate",
+                        "Delayed predictions",
                       ]}
                     />
 
                     <Bar
                       dataKey="delayed_prediction_percentage"
-                      fill="#2563eb"
                       radius={[
                         5,
                         5,
@@ -1154,25 +1228,20 @@ function App() {
                 </div>
               )}
             </div>
+          </div>
 
-          </article>
 
+          <div className="chart-card">
+            <div className="card-heading">
+              <h2>
+                Prediction Stability
+              </h2>
 
-          <article className="card chart-card">
-
-            <div className="card-header">
-              <div>
-                <h2>
-                  Prediction Stability
-                </h2>
-
-                <p>
-                  Average change in
-                  predicted arrival time
-                  during each five-minute
-                  interval.
-                </p>
-              </div>
+              <p>
+                Average change in predicted
+                arrival time during each
+                five-minute interval.
+              </p>
             </div>
 
             <div className="chart-container">
@@ -1180,7 +1249,7 @@ function App() {
               0 ? (
                 <ResponsiveContainer
                   width="100%"
-                  height={340}
+                  height={300}
                 >
                   <LineChart
                     data={
@@ -1188,14 +1257,13 @@ function App() {
                     }
                     margin={{
                       top: 10,
-                      right: 20,
+                      right: 15,
+                      bottom: 10,
                       left: 0,
-                      bottom: 5,
                     }}
                   >
                     <CartesianGrid
                       strokeDasharray="3 3"
-                      vertical={false}
                     />
 
                     <XAxis
@@ -1203,17 +1271,7 @@ function App() {
                       minTickGap={35}
                     />
 
-                    <YAxis
-                      domain={[
-                        0,
-                        "auto",
-                      ]}
-                      tickFormatter={(
-                        value
-                      ) =>
-                        `${value}m`
-                      }
-                    />
+                    <YAxis />
 
                     <Tooltip
                       formatter={(
@@ -1222,14 +1280,13 @@ function App() {
                         `${Number(
                           value
                         ).toFixed(2)} min`,
-                        "Average prediction change",
+                        "Avg prediction change",
                       ]}
                     />
 
                     <Line
                       type="monotone"
                       dataKey="average_prediction_change_minutes"
-                      stroke="#2563eb"
                       strokeWidth={3}
                       dot={false}
                       activeDot={{
@@ -1245,82 +1302,55 @@ function App() {
                 </div>
               )}
             </div>
-
-          </article>
+          </div>
 
         </section>
 
 
-        {/* ALERTS */}
+        <section className="section-card">
+          <div className="card-heading">
+            <h2>
+              Active Service Alerts
+            </h2>
 
-        <section className="card">
-
-          <div className="card-header">
-            <div>
-              <h2>
-                Active Service Alerts
-              </h2>
-
-              <p>
-                Current MTA subway
-                service notices.
-              </p>
-            </div>
-
-            <span className="section-count">
-              {alerts.length}
-            </span>
+            <p>
+              Current MTA subway
+              service notices.
+            </p>
           </div>
 
-
-          {alerts.length === 0 ? (
-            <div className="empty-state">
-              No active service alerts.
-            </div>
-          ) : (
+          {alerts.length > 0 ? (
             <div className="alerts-list">
               {alerts.map(
-                (alert) => (
+                (alert, index) => (
                   <article
-                    className="alert-item"
-                    key={alert.id}
+                    className="alert-card"
+                    key={
+                      alert.id ??
+                      `${alert.header_text}-${index}`
+                    }
                   >
-                    <div className="alert-top-row">
+                    <div className="alert-header">
                       <strong>
-                        {alert.header}
+                        {alert.header_text ||
+                          "Service Alert"}
                       </strong>
 
-                      <span className="alert-effect">
-                        {
-                          alert.effect
-                        }
-                      </span>
+                      {alert.routes &&
+                        alert.routes
+                          .length > 0 && (
+                          <span className="alert-routes">
+                            {alert.routes.join(
+                              ", "
+                            )}
+                          </span>
+                        )}
                     </div>
 
-                    {alert.routes
-                      .length > 0 && (
-                      <div className="alert-routes">
-                        {alert.routes.map(
-                          (route) => (
-                            <span
-                              className="mini-route"
-                              key={
-                                route
-                              }
-                            >
-                              {
-                                route
-                              }
-                            </span>
-                          )
-                        )}
-                      </div>
-                    )}
-
-                    {alert.description && (
+                    {alert.description_text && (
                       <p>
                         {
-                          alert.description
+                          alert.description_text
                         }
                       </p>
                     )}
@@ -1328,33 +1358,25 @@ function App() {
                 )
               )}
             </div>
+          ) : (
+            <div className="empty-state">
+              No active service alerts.
+            </div>
           )}
-
         </section>
 
 
-        {/* MAP */}
+        <section className="section-card">
+          <div className="card-heading">
+            <h2>
+              Subway Station Map
+            </h2>
 
-        <section className="card map-card">
-
-          <div className="card-header">
-            <div>
-              <h2>
-                Subway Station Map
-              </h2>
-
-              <p>
-                Click any station dot to
-                load its live arrival
-                board.
-              </p>
-            </div>
-
-            <span className="section-count">
-              {stations.length}
-            </span>
+            <p>
+              Click any station dot to
+              load its live arrival board.
+            </p>
           </div>
-
 
           <div className="map-wrapper">
             <MapContainer
@@ -1365,7 +1387,7 @@ function App() {
               zoom={11}
               scrollWheelZoom
               style={{
-                height: "500px",
+                height: "520px",
                 width: "100%",
               }}
             >
@@ -1373,9 +1395,6 @@ function App() {
                 attribution='&copy; OpenStreetMap contributors'
                 url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
               />
-
-
-              {/* ALWAYS render every station */}
 
               {stations.map(
                 (station) => {
@@ -1426,104 +1445,70 @@ function App() {
                       }}
                     >
                       <Popup>
-                        <div className="map-popup">
-                          <strong>
-                            {
-                              station.station_name
-                            }
-                          </strong>
+                        <strong>
+                          {
+                            station.station_name
+                          }
+                        </strong>
 
-                          <button
-                            type="button"
-                            onClick={() =>
-                              chooseStation(
-                                station.station_name
-                              )
-                            }
-                          >
-                            View live arrivals
-                          </button>
-                        </div>
+                        <br />
+
+                        Click to view
+                        arrivals
                       </Popup>
                     </CircleMarker>
                   );
                 }
               )}
-
             </MapContainer>
           </div>
-
         </section>
 
 
-        {/* LIVE ARRIVALS */}
+        <section className="section-card">
+          <div className="card-heading">
+            <h2>
+              Live Arrivals
+            </h2>
 
-        <section className="card arrivals-card">
-
-          <div className="card-header">
-            <div>
-              <h2>
-                Live Arrivals
-              </h2>
-
-              <p>
-                {selectedStation
-                  ? `Realtime arrivals for ${selectedStation}.`
-                  : "Choose a station from search or the map."}
-              </p>
-            </div>
-
-            {selectedStation && (
-              <span className="section-count">
-                {arrivals.length}{" "}
-                {arrivals.length === 1
-                  ? "arrival"
-                  : "arrivals"}
-              </span>
-            )}
+            <p>
+              {selectedStation
+                ? `Realtime arrival predictions for ${selectedStation}. Automatically refreshes every 30 seconds.`
+                : "Choose a station from search or the map."}
+            </p>
           </div>
 
-
           {!selectedStation ? (
-            <div className="station-required-state">
-              <div className="station-required-icon">
-                🚇
-              </div>
-
-              <h3>
+            <div className="empty-state">
+              <strong>
                 Select a station
-              </h3>
+              </strong>
 
               <p>
                 Search above or click a
-                blue station marker on
-                the map to see live MTA
-                arrival predictions.
+                station marker on the map
+                to see live MTA arrival
+                predictions.
               </p>
             </div>
-          ) : loading &&
-            arrivals.length === 0 ? (
-            <div className="empty-state">
-              Loading live arrivals...
-            </div>
-          ) : error ? (
-            <div className="empty-state">
-              {error}
-            </div>
-          ) : arrivals.length === 0 ? (
+          ) : arrivals.length ===
+            0 ? (
             <div className="empty-state">
               No upcoming arrivals found
-              for {selectedStation}.
+              for this station.
             </div>
           ) : (
             <div className="arrivals-list">
               {arrivals.map(
-                (arrival) => (
-                  <article
-                    className="arrival-item"
-                    key={`${arrival.trip_id}-${arrival.stop_id}-${arrival.arrival_time}`}
+                (
+                  arrival,
+                  index
+                ) => (
+                  <div
+                    className="arrival-row"
+                    key={`${arrival.trip_id ?? "trip"}-${arrival.stop_id ?? "stop"}-${arrival.arrival_timestamp ?? index}`}
                   >
-                    <div className="route-badge">
+                    <div className="arrival-route">
                       {
                         arrival.route_id
                       }
@@ -1537,9 +1522,8 @@ function App() {
                       </strong>
 
                       <span>
-                        {
-                          arrival.direction
-                        }
+                        {arrival.direction ||
+                          "Direction unavailable"}
                       </span>
                     </div>
 
@@ -1548,13 +1532,19 @@ function App() {
                         arrival.minutes_away
                       )}
                     </div>
-                  </article>
+                  </div>
                 )
               )}
             </div>
           )}
-
         </section>
+
+
+        {loading && (
+          <div className="loading-overlay">
+            Loading transit data...
+          </div>
+        )}
 
       </main>
     </div>
